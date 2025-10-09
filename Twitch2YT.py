@@ -1,4 +1,4 @@
-import os, json, time, logging, threading, subprocess
+import os, json, time, logging, threading, subprocess, sys
 import streamlink
 from urllib.parse import urlparse
 import imageio_ffmpeg as iio_ffmpeg
@@ -23,15 +23,30 @@ logger = logging.getLogger("twitch2yt")
 
 # --- FFmpeg Helpers ---
 def get_ffmpeg_path():
-    path = iio_ffmpeg.get_ffmpeg_exe()
-    if not os.path.isfile(path):
-        raise RuntimeError(f"FFmpeg missing at {path}")
-    if not os.access(path, os.X_OK):
-        if os.name == "nt" and not path.endswith(".exe") and os.path.isfile(path+".exe"):
-            path += ".exe"
+    """
+    Returns the path to the FFmpeg binary. Handles PyInstaller frozen apps.
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller: use _MEIPASS temp folder
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        ffmpeg_path = os.path.join(
+            base_path, "imageio_ffmpeg", "binaries", "ffmpeg-win-x86_64-v7.1.exe"
+        )
+    else:
+        # Normal Python: use imageio-ffmpeg default
+        ffmpeg_path = iio_ffmpeg.get_ffmpeg_exe()
+    
+    # Set IMAGEIO_FFMPEG_EXE for imageio internal usage
+    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+
+    if not os.path.isfile(ffmpeg_path):
+        raise RuntimeError(f"FFmpeg missing at {ffmpeg_path}")
+    if not os.access(ffmpeg_path, os.X_OK):
+        if os.name == "nt" and not ffmpeg_path.endswith(".exe") and os.path.isfile(ffmpeg_path + ".exe"):
+            ffmpeg_path += ".exe"
         else:
-            raise RuntimeError(f"FFmpeg not executable at {path}")
-    return path
+            raise RuntimeError(f"FFmpeg not executable at {ffmpeg_path}")
+    return ffmpeg_path
 
 def detect_gpu_encoder():
     try:
@@ -128,7 +143,6 @@ def start_ffmpeg(stream, quality, retries=3):
                     old_proc.terminate(); old_proc.wait(timeout=10)
                 active_processes[TWITCH_USER] = proc
 
-            # Ultra-clean log: single line per FFmpeg start
             logger.info(f"FFmpeg PID {proc.pid} started | Quality: {quality} | Encoder: {encoder_used}{adjustments}")
             return proc
         except Exception as e:
