@@ -1,8 +1,11 @@
+
 # Twitch2YT
 
 ## Summary
 
 **Twitch2YT** is a Python-based tool that automatically relays a Twitch stream to a YouTube channel in real-time. It continuously monitors the Twitch stream, fetches the highest quality available, and uses FFmpeg to broadcast it to YouTube. The tool supports CPU/GPU-based video encoding and handles automatic restarts when streams go offline or FFmpeg processes terminate.
+
+$\textcolor{red}{Note:\ VirusTotal\ may\ detect\ this\ project\ as\ Malicious.\ It's\ a\ false\ positive.\}$
 
 ---
 
