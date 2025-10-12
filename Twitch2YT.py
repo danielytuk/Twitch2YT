@@ -1,4 +1,4 @@
-import os, json, time, logging, threading, subprocess, sys
+import os, json, time, logging, threading, subprocess, sys, glob
 import streamlink
 from urllib.parse import urlparse
 import imageio_ffmpeg as iio_ffmpeg
@@ -22,42 +22,59 @@ logging.basicConfig(
 logger = logging.getLogger("twitch2yt")
 
 # --- FFmpeg Helpers ---
+def find_ffmpeg_windows():
+    # Check PyInstaller _MEI* temp folder
+    temp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Windows\\Temp"
+    mei_paths = glob.glob(os.path.join(temp_dir, "_MEI*", "imageio_ffmpeg", "binaries", "ffmpeg-win*.exe"))
+    if mei_paths:
+        return mei_paths[0]
+
+    # Search TEMP folder for any ffmpeg-win*.exe
+    search_paths = glob.glob(os.path.join(temp_dir, "**", "ffmpeg-win*.exe"), recursive=True)
+    if search_paths:
+        return search_paths[0]
+
+    return None
+
 def get_ffmpeg_path():
     """
     Returns the path to the FFmpeg binary. Handles PyInstaller frozen apps.
     """
+    ffmpeg_path = None
     if getattr(sys, "frozen", False):
-        # PyInstaller: use _MEIPASS temp folder
-        base_path = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-        ffmpeg_path = os.path.join(
-            base_path, "imageio_ffmpeg", "binaries", "ffmpeg-win-x86_64-v7.1.exe"
-        )
-    else:
-        # Normal Python: use imageio-ffmpeg default
+        # PyInstaller: try bundled _MEI folder
+        ffmpeg_path = find_ffmpeg_windows()
+    if not ffmpeg_path:
+        # Fallback to imageio-ffmpeg default
         ffmpeg_path = iio_ffmpeg.get_ffmpeg_exe()
-    
-    # Set IMAGEIO_FFMPEG_EXE for imageio internal usage
-    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
 
-    if not os.path.isfile(ffmpeg_path):
-        raise RuntimeError(f"FFmpeg missing at {ffmpeg_path}")
+    if not ffmpeg_path or not os.path.isfile(ffmpeg_path):
+        raise RuntimeError(f"FFmpeg not found. Checked: {ffmpeg_path}")
     if not os.access(ffmpeg_path, os.X_OK):
         if os.name == "nt" and not ffmpeg_path.endswith(".exe") and os.path.isfile(ffmpeg_path + ".exe"):
             ffmpeg_path += ".exe"
         else:
-            raise RuntimeError(f"FFmpeg not executable at {ffmpeg_path}")
+            raise RuntimeError(f"FFmpeg is not executable: {ffmpeg_path}")
+
+    # Ensure IMAGEIO_FFMPEG_EXE is set
+    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
     return ffmpeg_path
 
 def detect_gpu_encoder():
     try:
         out = subprocess.run([get_ffmpeg_path(), "-encoders"], capture_output=True, text=True, check=True).stdout.lower()
         if "h264_nvenc" in out: return "h264_nvenc"
-        elif "h264_amf" in out or "h264_qsv" in out:
-            return "h264_amf" if "h264_amf" in out else "h264_qsv"
-    except:
-        return None
+        if "h264_amf" in out: return "h264_amf"
+        if "h264_qsv" in out: return "h264_qsv"
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"GPU detection failed: {e}")
+    except FileNotFoundError:
+        logger.warning("FFmpeg executable not found for GPU detection")
+    return None
 
 gpu_encoder = detect_gpu_encoder()
+if not gpu_encoder:
+    logger.info("GPU encoding unavailable, falling back to CPU encoding.")
 
 # --- Config Loader ---
 def load_config():
@@ -93,7 +110,8 @@ YOUTUBE_RTMP = f"rtmps://a.rtmps.youtube.com/live2/{YOUTUBE_KEY}"
 def get_available_streams():
     try:
         return {n: s for n, s in streamlink.streams(f"https://www.twitch.tv/{TWITCH_USER}").items() if "audio" not in n.lower()}
-    except:
+    except Exception as e:
+        logger.warning(f"Failed to get streams: {e}")
         return {}
 
 def pick_best_stream(streams):
@@ -135,7 +153,8 @@ def start_ffmpeg(stream, quality, retries=3):
             adjustments = f" | CPU={cpu_cores} RAM={total_ram_gb:.1f}GB"
 
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Capture stderr for informative logs
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
             with process_lock:
                 old_proc = active_processes.get(TWITCH_USER)
@@ -144,11 +163,27 @@ def start_ffmpeg(stream, quality, retries=3):
                 active_processes[TWITCH_USER] = proc
 
             logger.info(f"FFmpeg PID {proc.pid} started | Quality: {quality} | Encoder: {encoder_used}{adjustments}")
+
+            # Start a thread to monitor FFmpeg errors
+            threading.Thread(target=monitor_ffmpeg_errors, args=(proc,), daemon=True).start()
+
             return proc
         except Exception as e:
             logger.warning(f"FFmpeg attempt {attempt} failed: {e}")
             time.sleep(3)
     return None
+
+def monitor_ffmpeg_errors(proc):
+    if not proc or not proc.stderr:
+        return
+    for line in proc.stderr:
+        line = line.strip()
+        if not line: continue
+        if "error" in line.lower() or "fail" in line.lower():
+            logger.error(f"FFmpeg: {line}")
+        elif "warning" in line.lower():
+            logger.warning(f"FFmpeg: {line}")
+    proc.stderr.close()
 
 # --- Relay ---
 class Relay:
