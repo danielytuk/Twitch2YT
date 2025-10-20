@@ -5,7 +5,7 @@ import imageio_ffmpeg as iio_ffmpeg
 
 # --- Config ---
 CONFIG_FILE = "config.json"
-FFMPEG_MAX_RUNTIME = 10.5*60*60
+FFMPEG_MAX_RUNTIME = 10.5 * 60 * 60
 cpu_cores = os.cpu_count() or 1
 try:
     import psutil
@@ -23,31 +23,21 @@ logger = logging.getLogger("twitch2yt")
 
 # --- FFmpeg Helpers ---
 def find_ffmpeg_windows():
-    # Check PyInstaller _MEI* temp folder
     temp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Windows\\Temp"
     mei_paths = glob.glob(os.path.join(temp_dir, "_MEI*", "imageio_ffmpeg", "binaries", "ffmpeg-win*.exe"))
     if mei_paths:
         return mei_paths[0]
-
-    # Search TEMP folder for any ffmpeg-win*.exe
     search_paths = glob.glob(os.path.join(temp_dir, "**", "ffmpeg-win*.exe"), recursive=True)
     if search_paths:
         return search_paths[0]
-
     return None
 
 def get_ffmpeg_path():
-    """
-    Returns the path to the FFmpeg binary. Handles PyInstaller frozen apps.
-    """
     ffmpeg_path = None
     if getattr(sys, "frozen", False):
-        # PyInstaller: try bundled _MEI folder
         ffmpeg_path = find_ffmpeg_windows()
     if not ffmpeg_path:
-        # Fallback to imageio-ffmpeg default
         ffmpeg_path = iio_ffmpeg.get_ffmpeg_exe()
-
     if not ffmpeg_path or not os.path.isfile(ffmpeg_path):
         raise RuntimeError(f"FFmpeg not found. Checked: {ffmpeg_path}")
     if not os.access(ffmpeg_path, os.X_OK):
@@ -55,8 +45,6 @@ def get_ffmpeg_path():
             ffmpeg_path += ".exe"
         else:
             raise RuntimeError(f"FFmpeg is not executable: {ffmpeg_path}")
-
-    # Ensure IMAGEIO_FFMPEG_EXE is set
     os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
     return ffmpeg_path
 
@@ -74,7 +62,7 @@ def detect_gpu_encoder():
 
 gpu_encoder = detect_gpu_encoder()
 if not gpu_encoder:
-    logger.info("GPU encoding unavailable, falling back to CPU encoding.")
+    logger.info("GPU encoding unavailable, will fall back to CPU if needed.")
 
 # --- Config Loader ---
 def load_config():
@@ -85,7 +73,8 @@ def load_config():
             if twitch.startswith("http"):
                 try:
                     p = urlparse(twitch)
-                    if p.netloc not in ("twitch.tv", "www.twitch.tv"): raise ValueError()
+                    if p.netloc not in ("twitch.tv", "www.twitch.tv"):
+                        raise ValueError()
                     u = p.path.strip("/")
                     cfg["username"] = u or None
                 except:
@@ -94,7 +83,8 @@ def load_config():
             else:
                 cfg["username"] = twitch if twitch else None
             cfg["youtube_key"] = input("YouTube stream key: ").strip()
-            with open(CONFIG_FILE, "w") as f: json.dump(cfg, f)
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f)
             print(f"Config saved to {CONFIG_FILE}")
         else:
             with open(CONFIG_FILE, "r") as f:
@@ -115,62 +105,103 @@ def get_available_streams():
         return {}
 
 def pick_best_stream(streams):
-    if "best" in streams: return "best", streams["best"]
+    if "best" in streams:
+        return "best", streams["best"]
     qs = [q for q in streams if any(c.isdigit() for c in q)]
     if qs:
         best_q = sorted(qs, reverse=True)[0]
         return best_q, streams[best_q]
     return next(iter(streams.items()))
 
-# --- Track active processes ---
+# --- Process Tracking ---
 active_processes = {}
 process_lock = threading.Lock()
 
 # --- FFmpeg Relay ---
 def start_ffmpeg(stream, quality, retries=3):
     global active_processes
+
     try:
+        # Pre-fetch Twitch HLS data to ensure FFmpeg gets valid video parameters
+        logger.info("Pre-fetching Twitch HLS segments to ensure valid video parameters...")
+        prewarm_ok = False
+        try:
+            fd = stream.open()
+            chunk_count = 0
+            for _ in range(3):
+                data = fd.read(1024 * 512)
+                if not data:
+                    break
+                chunk_count += 1
+                time.sleep(0.3)
+            fd.close()
+            if chunk_count > 0:
+                prewarm_ok = True
+                logger.info(f"HLS manifest pre-fetched successfully ({chunk_count} chunks).")
+        except Exception as e:
+            logger.warning(f"Failed to prefetch HLS data (continuing anyway): {e}")
+
         url = stream.to_url()
+        if not url or not url.startswith("http"):
+            logger.error(f"Invalid stream URL: {url}")
+            return None
+
     except Exception as e:
         logger.error(f"Cannot get stream URL: {e}")
         return None
 
     ffmpeg_path = get_ffmpeg_path()
 
-    for attempt in range(1, retries+1):
-        cmd = [ffmpeg_path, "-nostats", "-loglevel", "warning", "-re", "-i", url,
-               "-c:a", "aac", "-ar", "44100", "-b:a", "128k", "-ac", "2",
-               "-f", "flv", YOUTUBE_RTMP]
-
-        encoder_used = "copy"
-        if gpu_encoder:
-            cmd.insert(7, "-c:v"); cmd.insert(8, gpu_encoder)
+    # Try with encoder priority: COPY → GPU → CPU
+    for attempt in range(1, retries + 1):
+        if attempt == 1:
+            encoder_used = "copy"
+            codec_flags = ["-c:v", "copy"]
+        elif attempt == 2 and gpu_encoder:
             encoder_used = gpu_encoder
+            codec_flags = ["-c:v", gpu_encoder, "-preset", "p1"]
+        else:
+            encoder_used = "libx264"
+            codec_flags = ["-c:v", "libx264", "-preset", "veryfast"]
+
+        cmd = [
+            ffmpeg_path, "-nostats", "-loglevel", "warning", "-re",
+            "-i", url,
+            *codec_flags,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-b:a", "128k", "-ac", "2",
+            "-bufsize", "2M", "-fflags", "+genpts",
+            "-f", "flv", YOUTUBE_RTMP,
+        ]
 
         adjustments = ""
         if low_cpu or low_ram:
-            cmd += ["-threads", str(max(1, cpu_cores)), "-bufsize", "2M", "-fflags", "+genpts"]
+            cmd += ["-threads", str(max(1, cpu_cores))]
             adjustments = f" | CPU={cpu_cores} RAM={total_ram_gb:.1f}GB"
 
         try:
-            # Capture stderr for informative logs
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
             with process_lock:
                 old_proc = active_processes.get(TWITCH_USER)
                 if old_proc and old_proc != proc:
-                    old_proc.terminate(); old_proc.wait(timeout=10)
+                    old_proc.terminate()
+                    try:
+                        old_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        old_proc.kill()
                 active_processes[TWITCH_USER] = proc
 
             logger.info(f"FFmpeg PID {proc.pid} started | Quality: {quality} | Encoder: {encoder_used}{adjustments}")
 
-            # Start a thread to monitor FFmpeg errors
             threading.Thread(target=monitor_ffmpeg_errors, args=(proc,), daemon=True).start()
-
             return proc
+
         except Exception as e:
-            logger.warning(f"FFmpeg attempt {attempt} failed: {e}")
+            logger.warning(f"FFmpeg attempt {attempt} ({encoder_used}) failed: {e}")
             time.sleep(3)
+
+    logger.error("All FFmpeg attempts failed.")
     return None
 
 def monitor_ffmpeg_errors(proc):
@@ -178,14 +209,15 @@ def monitor_ffmpeg_errors(proc):
         return
     for line in proc.stderr:
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
         if "error" in line.lower() or "fail" in line.lower():
             logger.error(f"FFmpeg: {line}")
         elif "warning" in line.lower():
             logger.warning(f"FFmpeg: {line}")
     proc.stderr.close()
 
-# --- Relay ---
+# --- Relay Class ---
 class Relay:
     def __init__(self):
         self.current_ffmpeg = None
@@ -250,8 +282,10 @@ class Relay:
         if self.current_ffmpeg and self.current_ffmpeg != new_ffmpeg:
             logger.info(f"Stopping previous FFmpeg PID {self.current_ffmpeg.pid}")
             self.current_ffmpeg.terminate()
-            try: self.current_ffmpeg.wait(timeout=10)
-            except: self.current_ffmpeg.kill()
+            try:
+                self.current_ffmpeg.wait(timeout=10)
+            except:
+                self.current_ffmpeg.kill()
         self.current_ffmpeg = new_ffmpeg
         self.current_quality = quality
         self.start_time = time.time()
