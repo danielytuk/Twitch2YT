@@ -25,7 +25,7 @@ $\textcolor{red}{Note:\ VirusTotal\ may\ detect\ this\ project\ as\ Malicious.\ 
 
 ### Download
 
-You can purchase the bundled executable for £5 GBP: [buymeacoffee/danielytuk](https://buymeacoffee.com/danielytuk/e/464645)
+You can download the bundled executable from my [buymeacoffee/danielytuk](https://buymeacoffee.com/danielytuk/e/464645) page.
 
 ### Prerequisites
 
